@@ -12,6 +12,11 @@
   code, stdout and stderr.
 - Log kernel worker arguments at the fine level instead of including them in
   kernel compilation errors.
+- Fix entrypoints under `lib/` failing to load and run
+  with DDC's library bundle module system.
+  Their scripts are now loaded relative to `packages/<package>/`,
+  the directory they're served from,
+  and `main` is run with the `package:` URI they're compiled with.
 
 ## 4.8.12
 

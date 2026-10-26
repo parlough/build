@@ -98,40 +98,56 @@ Future<void> bootstrapDdc(
     ddcBootstrapEndExtension,
   );
 
-  final dartEntrypointParts = _context.split(dartEntrypointId.path);
+  final [topLevelDir, ...pathInTopLevelDir] = _context.split(
+    dartEntrypointId.path,
+  );
   final packageName = module.primarySource.package;
   final entrypointLibraryName = ddcLibraryBundle
-      ? _context.joinAll([
-          // Convert to a package: uri for files under lib.
-          if (dartEntrypointParts.first == 'lib') 'package:$packageName',
-          ...dartEntrypointParts,
-        ])
+      // The library bundle format identifies libraries
+      // by the URI they were compiled with,
+      // so this must match what was passed to the compiler.
+      ? sourceArg(dartEntrypointId)
       : _context.joinAll([
           // Convert to a package: uri for files under lib.
-          if (dartEntrypointParts.first == 'lib') 'package:$packageName',
+          if (topLevelDir == 'lib') 'package:$packageName',
           // Strip top-level directory from the path.
-          ...dartEntrypointParts.skip(1),
+          ...pathInTopLevelDir,
         ]);
 
   final entrypointJsId = dartEntrypointId.changeExtension(entrypointExtension);
 
   // Map from module name to module path for custom modules.
   final modulePaths = SplayTreeMap<String, String>();
-  String entrypointJsContent;
-  String bootstrapContent;
-  String bootstrapEndContent;
+  final String entrypointJsContent;
+  final String bootstrapContent;
+  final String bootstrapEndContent;
   if (ddcLibraryBundle) {
-    final ddcSdkUrl =
-        r'packages/build_web_compilers/src/dev_compiler/dart_sdk.js';
+    // The loader resolves scripts relative to
+    // the directory the entrypoint is served from.
+    // Entrypoints under `lib/` are served from `packages/<package>/`,
+    // where the server can't resolve a nested `packages/` path,
+    // so paths from the server root are made relative to that directory.
+    final servedEntrypointDir = topLevelDir == 'lib'
+        ? _context.dirname(
+            _context.joinAll(['packages', packageName, ...pathInTopLevelDir]),
+          )
+        : null;
+    String fromServerRoot(String path) => servedEntrypointDir == null
+        ? path
+        : _context.relative(path, from: servedEntrypointDir);
+
+    final ddcSdkUrl = fromServerRoot(
+      'packages/build_web_compilers/src/dev_compiler/dart_sdk.js',
+    );
     modulePaths['dart_sdk'] = ddcSdkUrl;
     for (final jsId in transitiveJsModules) {
-      // Strip out the top level dir from the path for any module, and set it to
-      // `packages/` for lib modules. We set baseUrl to `/` to simplify things,
-      // and we only allow you to serve top level directories.
+      // Load lib modules from where they're served under `packages/`,
+      // and other modules relative to the entrypoint,
+      // as they're in the same top level directory.
       final moduleName = ddcModuleName(jsId);
       final id = '$moduleName.dart';
       modulePaths[id] = jsId.path.startsWith('lib')
-          ? '$moduleName$jsModuleExtension'
+          ? fromServerRoot('$moduleName$jsModuleExtension')
           : _context.relative(
               jsId.path,
               from: _context.dirname(dartEntrypointId.path),
@@ -153,10 +169,11 @@ Future<void> bootstrapDdc(
     entrypointJsContent = generateDDCLibraryBundleBootstrapScript(
       entrypoint: entrypointLibraryName,
       ddcSdkUrl: ddcSdkUrl,
-      ddcModuleLoaderUrl:
-          'packages/build_web_compilers/src/dev_compiler/ddc_module_loader.js',
-      mainBoostrapperUrl: bootstrapModuleName,
-      mapperUrl: stackTraceMapperPath,
+      ddcModuleLoaderUrl: fromServerRoot(
+        'packages/build_web_compilers/src/dev_compiler/ddc_module_loader.js',
+      ),
+      mainBootstrapperUrl: bootstrapModuleName,
+      mapperUrl: fromServerRoot(stackTraceMapperPath),
       scriptIdsToPath: modulePaths,
     );
     bootstrapEndContent = generateDDCLibraryBundleOnLoadEndBootstrap();
@@ -671,11 +688,15 @@ var forceLoadModule = function (relativeUrl, root) {
 };
 ''';
 
+/// Generates the entrypoint script that loads the DDC library bundle app.
+///
+/// [entrypoint] is the URI the entrypoint library was compiled with,
+/// as returned by [sourceArg].
 String generateDDCLibraryBundleBootstrapScript({
   required String entrypoint,
   required String ddcSdkUrl,
   required String ddcModuleLoaderUrl,
-  required String mainBoostrapperUrl,
+  required String mainBootstrapperUrl,
   required String mapperUrl,
   required Map<String, String> scriptIdsToPath,
 }) {
@@ -683,9 +704,9 @@ String generateDDCLibraryBundleBootstrapScript({
   scriptIdsToPath.forEach((id, path) {
     scriptsJs.write('{"src": "$path", "id": "$id"},\n');
   });
-  // Write the "true" main boostrapper last as part of the loader's convention.
-  scriptsJs.write('{"src": "$mainBoostrapperUrl", "id": "data-main"}\n');
-  final boostrapScript =
+  // Write the "true" main bootstrapper last as part of the loader's convention.
+  scriptsJs.write('{"src": "$mainBootstrapperUrl", "id": "data-main"}\n');
+  final bootstrapScript =
       '''
 // Save the current directory so we can access it in a closure.
   let _currentDirectory = (function () {
@@ -703,7 +724,7 @@ String generateDDCLibraryBundleBootstrapScript({
 $_simpleLoaderScript
 
 (function() {
-  let appName = "$multiRootScheme:///$entrypoint";
+  let appName = "$entrypoint";
 
   // Load pre-requisite DDC scripts. We intentionally use invalid names to avoid
   // namespace clashes.
@@ -833,9 +854,14 @@ $_simpleLoaderScript
   };
 })();
 ''';
-  return boostrapScript;
+  return bootstrapScript;
 }
 
+/// Generates the bootstrap module that
+/// runs `main` of the DDC library bundle app.
+///
+/// [entrypoint] is the URI the entrypoint library was compiled with,
+/// as returned by [sourceArg].
 String generateDDCLibraryBundleMainModule({
   required String entrypoint,
   required bool nativeNullAssertions,
@@ -846,7 +872,7 @@ String generateDDCLibraryBundleMainModule({
 /* ENTRYPOINT_EXTENTION_MARKER */
 
 (function() {
-  let appName = "$multiRootScheme:///$entrypoint";
+  let appName = "$entrypoint";
   dartDevEmbedder.debugger.registerDevtoolsFormatter();
 
   // Set up a final script that lets us know when all scripts have been loaded.
